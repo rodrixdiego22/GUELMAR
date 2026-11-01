@@ -27,8 +27,13 @@ import streamlit as st
 
 # ============================================================
 # GUELMAR - SISTEMA INTEGRAL DE GESTIÓN COMERCIAL
-# Versión 1.4.16 CLOUD - Inventario central Supabase - V6 Optimizado
+# Versión 1.6.0 CLOUD MULTISUCURSAL - catálogo compartido e inventario por sucursal
 # ============================================================
+
+# GUELMAR V16 MULTISUCURSAL - CANDIDATO DE PRUEBA INDEPENDIENTE.
+# No reemplaza GUELMAR V14.15 local. Requiere revisar y aplicar por separado
+# la migración SQL V16 en un proyecto Supabase de prueba antes de ejecutarlo.
+# No ejecutar sobre producción hasta verificar respaldo, esquema y pruebas.
 
 
 # ===== GUELMAR V10: CONTRASTE TOTAL — MISMA LEGIBILIDAD EN CLARO Y OSCURO =====
@@ -229,7 +234,8 @@ DB_PATH = BASE_DIR / "guelmar.db"
 IMG_DIR = BASE_DIR / "imagenes_productos"
 BACKUP_DIR = BASE_DIR / "backups"
 
-IMG_DIR.mkdir(exist_ok=True)
+# Esta versión no importa ni crea imágenes nuevas de productos.
+# Si ya existe IMG_DIR, se conserva intacta.
 BACKUP_DIR.mkdir(exist_ok=True)
 
 
@@ -255,9 +261,10 @@ class CloudCursor:
         # El programa original usa ?; CloudCursor lo adapta a PostgreSQL.
         # PostgreSQL utiliza %s.
         sql = sql.replace("?", "%s")
-        # Compatibilidad con el único INSERT OR IGNORE histórico del módulo fiscal.
-        sql = re.sub(r"^\s*INSERT\s+OR\s+IGNORE\s+INTO", "INSERT INTO", sql,
-                     flags=re.IGNORECASE)
+        # No traducir INSERT OR IGNORE de SQLite a INSERT normal: en PostgreSQL
+        # eso cambiaría silenciosamente la semántica y podría causar duplicados/error.
+        # El código actual no utiliza INSERT OR IGNORE; cualquier uso futuro debe
+        # convertirse explícitamente a ON CONFLICT (...) DO NOTHING.
         return sql
 
     def execute(self, sql, params=()):
@@ -265,9 +272,18 @@ class CloudCursor:
         # Para INSERTs del sistema necesitamos recuperar el id generado,
         # equivalente a lastrowid para el código histórico de GUELMAR.
         is_insert = bool(re.match(r"^\s*INSERT\s+INTO\b", sql, re.IGNORECASE))
-        if is_insert and "RETURNING" not in sql.upper():
+        # inventario_sucursal usa una clave primaria compuesta (producto_id, sucursal_id)
+        # en la base existente; no tiene columna id. No agregar RETURNING id a esa tabla.
+        match_table = re.match(r"^\s*INSERT\s+INTO\s+(?:public\.)?(\w+)", sql, re.IGNORECASE)
+        insert_table = match_table.group(1).strip('"').lower() if match_table else ""
+        if is_insert and insert_table != "inventario_sucursal" and "RETURNING" not in sql.upper():
             sql = sql.rstrip().rstrip(";") + " RETURNING id"
-        self._cur.execute(sql, params or ())
+        # Evita que psycopg2 intente interpolar signos % de patrones SQL
+        # cuando la consulta no tiene parámetros (por ejemplo ILIKE '%texto%').
+        if params:
+            self._cur.execute(sql, params)
+        else:
+            self._cur.execute(sql)
         self._lastrowid = None
         if is_insert:
             try:
@@ -287,6 +303,11 @@ class CloudCursor:
     @property
     def lastrowid(self):
         return self._lastrowid
+
+    @property
+    def rowcount(self):
+        """Número de filas afectadas por la última instrucción SQL."""
+        return self._cur.rowcount
 
 
 class CloudConnection:
@@ -309,8 +330,16 @@ class CloudConnection:
             return
         self._closed = True
         try:
+            # Una consulta que falla puede dejar la transacción PostgreSQL abortada.
+            # Limpiar siempre el estado antes de devolver la conexión al pool evita
+            # que la siguiente operación herede una transacción fallida o sin confirmar.
+            try:
+                if not self._raw.closed:
+                    self._raw.rollback()
+            except Exception:
+                pass
             # Devuelve la conexión al pool en vez de cerrar el socket SSL.
-            if self._pool is not None:
+            if self._pool is not None and not self._raw.closed:
                 self._pool.putconn(self._raw)
             else:
                 self._raw.close()
@@ -1260,26 +1289,52 @@ def init_db():
     try:
         # Las tablas se crean mediante el SQL de Supabase preparado para GUELMAR.
         conn.execute("SELECT 1")
+        # V16 requiere que la migración de inventario por sucursal ya exista.
+        conn.execute("SELECT 1 FROM inventario_sucursal LIMIT 0")
+        conn.execute("SELECT 1 FROM sucursales LIMIT 0")
+        # Registro de auditoría V16: solo el administrador podrá consultar la interfaz.
+        conn.execute("""CREATE TABLE IF NOT EXISTS auditoria_actividad (
+            id BIGSERIAL PRIMARY KEY,
+            usuario_id BIGINT NULL,
+            usuario TEXT NOT NULL,
+            rol TEXT NOT NULL,
+            sucursal_id BIGINT NULL,
+            evento TEXT NOT NULL,
+            detalle TEXT NOT NULL DEFAULT '',
+            resultado TEXT NOT NULL DEFAULT 'Correcto',
+            fecha_hora TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_auditoria_fecha ON auditoria_actividad(fecha_hora DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_auditoria_usuario ON auditoria_actividad(usuario, fecha_hora DESC)")
         conn.commit()
 
-        # Primer arranque: crea los usuarios históricos si todavía no existen.
+        # Primer arranque: no crear cuentas con contraseñas públicas por defecto.
+        # El administrador debe configurarse explícitamente mediante variables de entorno.
         if conn.execute("SELECT COUNT(*) FROM usuarios").fetchone()[0] == 0:
+            try:
+                secret_admin_user = st.secrets.get("GUELMAR_ADMIN_USER", "")
+                secret_admin_password = st.secrets.get("GUELMAR_ADMIN_PASSWORD", "")
+            except Exception:
+                secret_admin_user = ""
+                secret_admin_password = ""
+            admin_user = (secret_admin_user or os.getenv("GUELMAR_ADMIN_USER") or "admin").strip()
+            admin_password = secret_admin_password or os.getenv("GUELMAR_ADMIN_PASSWORD", "")
+            if len(admin_password) < 12:
+                raise RuntimeError(
+                    "No hay usuarios configurados. Antes del primer inicio, define "
+                    "GUELMAR_ADMIN_PASSWORD con una contraseña de al menos 12 caracteres "
+                    "y opcionalmente GUELMAR_ADMIN_USER. No se crearán usuarios con la "
+                    "contraseña insegura 1234."
+                )
             branch = conn.execute(
                 "SELECT id FROM sucursales WHERE activa=TRUE ORDER BY id LIMIT 1"
             ).fetchone()
             branch_id = branch["id"] if branch else None
-            now = datetime.now()
             conn.execute(
                 """INSERT INTO usuarios
                    (usuario,password,rol,activo,sucursal_id,creado_en)
                    VALUES(?,?,?,?,?,?)""",
-                ("admin", hash_password("1234"), "Administrador", True, branch_id, now)
-            )
-            conn.execute(
-                """INSERT INTO usuarios
-                   (usuario,password,rol,activo,sucursal_id,creado_en)
-                   VALUES(?,?,?,?,?,?)""",
-                ("cajero", hash_password("1234"), "Vendedor", True, branch_id, now)
+                (admin_user, hash_password(admin_password), "Administrador", True, branch_id, datetime.now())
             )
 
         if conn.execute("SELECT COUNT(*) FROM clientes").fetchone()[0] == 0:
@@ -1330,6 +1385,76 @@ def query_df(sql, params=()):
         conn.close()
 
 
+
+def exportar_ventas_excel(df):
+    """Genera un archivo Excel liviano, sin imágenes."""
+    try:
+        buffer = BytesIO()
+        with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+            df.to_excel(writer, index=False, sheet_name="Ventas")
+            resumen = pd.DataFrame([{
+                "Registros": len(df),
+                "Total ventas activas (Bs)": (
+                    pd.to_numeric(df.loc[df["Estado"] == "ACTIVA", "Total"], errors="coerce").fillna(0).sum()
+                    if "Estado" in df.columns and "Total" in df.columns else 0
+                ),
+                "Ventas anuladas": int((df["Estado"] == "ANULADA").sum()) if "Estado" in df.columns else 0
+            }])
+            resumen.to_excel(writer, index=False, sheet_name="Resumen")
+        return buffer.getvalue()
+    except Exception:
+        return None
+
+
+def exportar_ventas_pdf(df, titulo="Informe de ventas"):
+    """PDF tabular sin imágenes de productos."""
+    try:
+        from reportlab.lib import colors
+        from reportlab.lib.pagesizes import A4, landscape
+        from reportlab.lib.styles import getSampleStyleSheet
+        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+        from reportlab.lib.units import mm
+        buffer = BytesIO()
+        doc = SimpleDocTemplate(buffer, pagesize=landscape(A4), rightMargin=7*mm, leftMargin=7*mm,
+                                topMargin=9*mm, bottomMargin=9*mm)
+        story = [Paragraph(titulo, getSampleStyleSheet()["Title"]), Spacer(1, 4*mm)]
+        if df.empty:
+            data = [["Sin registros para los filtros seleccionados"]]
+        else:
+            safe_df = df.fillna("").astype(str)
+            data = [list(safe_df.columns)] + safe_df.values.tolist()
+        table = Table(data, repeatRows=1)
+        table.setStyle(TableStyle([
+            ("BACKGROUND",(0,0),(-1,0),colors.HexColor("#17365D")),
+            ("TEXTCOLOR",(0,0),(-1,0),colors.white),
+            ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),
+            ("FONTSIZE",(0,0),(-1,-1),6.5),
+            ("GRID",(0,0),(-1,-1),0.3,colors.HexColor("#B7C9D6")),
+            ("VALIGN",(0,0),(-1,-1),"TOP"),
+            ("ROWBACKGROUNDS",(0,1),(-1,-1),[colors.white,colors.HexColor("#F1F5F9")]),
+        ]))
+        story.append(table)
+        doc.build(story)
+        return buffer.getvalue()
+    except Exception:
+        return None
+
+
+def rango_periodo_ventas(periodo, hoy=None):
+    hoy = hoy or date.today()
+    if periodo == "Hoy":
+        return hoy, hoy
+    if periodo == "Esta semana":
+        return hoy - timedelta(days=hoy.weekday()), hoy
+    if periodo == "Quincena (últimos 15 días)":
+        return hoy - timedelta(days=14), hoy
+    if periodo == "Este mes":
+        return hoy.replace(day=1), hoy
+    if periodo == "Este año":
+        return hoy.replace(month=1, day=1), hoy
+    return hoy, hoy
+
+
 @st.cache_data(ttl=15, show_spinner=False)
 def scalar(sql, params=()):
     """Valores de solo lectura cacheados brevemente para reducir viajes a Supabase."""
@@ -1365,6 +1490,43 @@ def get_product(product_id):
     return row
 
 
+def obtener_stock_sucursal(conn, producto_id, sucursal_id):
+    """Lee el stock de un producto en una sucursal. Requiere la migración SQL V16."""
+    if sucursal_id is None:
+        raise ValueError("El usuario debe tener una sucursal asignada para operar inventario.")
+    row = conn.execute(
+        "SELECT stock FROM inventario_sucursal WHERE producto_id=? AND sucursal_id=?",
+        (producto_id, sucursal_id),
+    ).fetchone()
+    return float(row["stock"] or 0) if row else 0.0
+
+
+def guardar_stock_sucursal(conn, producto_id, sucursal_id, stock):
+    """Guarda una existencia por sucursal; el stock general se recalcula como suma."""
+    if sucursal_id is None:
+        raise ValueError("No se puede modificar stock sin una sucursal asignada.")
+    stock = float(stock)
+    if stock < 0:
+        raise ValueError("El stock de una sucursal no puede ser negativo.")
+    conn.execute(
+        """INSERT INTO inventario_sucursal (producto_id,sucursal_id,stock,actualizado_en)
+           VALUES(?,?,?,?)
+           ON CONFLICT(producto_id,sucursal_id) DO UPDATE
+           SET stock=EXCLUDED.stock, actualizado_en=EXCLUDED.actualizado_en""",
+        (producto_id, sucursal_id, stock, datetime.now()),
+    )
+    conn.execute(
+        """UPDATE productos SET stock=(
+               SELECT COALESCE(SUM(stock),0) FROM inventario_sucursal WHERE producto_id=?
+           ) WHERE id=?""",
+        (producto_id, producto_id),
+    )
+
+
+def sucursales_activas():
+    return query_df("SELECT id,nombre FROM sucursales WHERE activa=TRUE ORDER BY id")
+
+
 def registrar_movimiento(conn, producto_id, tipo, cantidad, anterior, nuevo, motivo, usuario_id, sucursal_id=None):
     sucursal_id = sucursal_id or st.session_state.get("sucursal_id") or st.session_state.get("usuario", {}).get("sucursal_id")
     conn.execute(
@@ -1391,6 +1553,7 @@ def verificar_integridad_db(db_path=None):
         "detalle_ventas", "movimientos_inventario", "cotizaciones",
         "detalle_cotizaciones", "configuracion_fiscal", "facturas",
         "detalle_facturas", "eventos_facturacion", "sincronizacion_sin",
+        "inventario_sucursal",
     }
     try:
         filas = conn.execute(
@@ -1404,7 +1567,7 @@ def verificar_integridad_db(db_path=None):
         if faltantes:
             return {
                 "ok": False,
-                "integrity": "Faltan tablas en la base central.",
+                "integrity": "Faltan tablas en la base central; verifica también inventario_sucursal para V16.",
                 "foreign_keys": [],
                 "quick": "",
                 "faltantes": faltantes,
@@ -1413,6 +1576,33 @@ def verificar_integridad_db(db_path=None):
         # Consulta sencilla de cada tabla esencial para comprobar acceso.
         for tabla in sorted(esenciales):
             conn.execute(f"SELECT 1 FROM {tabla} LIMIT 1").fetchone()
+
+        columnas_requeridas = {
+            "usuarios": {"id", "usuario", "password", "rol", "activo", "sucursal_id"},
+            "sucursales": {"id", "nombre", "activa"},
+            "productos": {"id", "codigo", "nombre", "categoria", "marca", "precio", "costo", "stock", "stock_minimo", "activo"},
+            "inventario_sucursal": {"producto_id", "sucursal_id", "stock", "actualizado_en"},
+            "ventas": {"id", "fecha", "cliente_id", "vendedor_id", "sucursal_id", "subtotal", "descuento", "total", "metodo_pago", "estado"},
+            "detalle_ventas": {"venta_id", "producto_id", "codigo", "nombre", "cantidad", "precio", "total"},
+            "clientes": {"id", "nit_ci", "nombre"},
+            "movimientos_inventario": {"fecha", "producto_id", "tipo", "cantidad", "stock_anterior", "stock_nuevo", "usuario_id", "sucursal_id"},
+            "auditoria_actividad": {"usuario_id", "usuario", "rol", "sucursal_id", "evento", "detalle", "resultado", "fecha_hora"},
+        }
+        col_rows = conn.execute("""SELECT table_name,column_name FROM information_schema.columns
+                                   WHERE table_schema='public'""").fetchall()
+        columnas_por_tabla = {}
+        for cr in col_rows:
+            columnas_por_tabla.setdefault(cr["table_name"], set()).add(cr["column_name"])
+        columnas_faltantes = []
+        for tabla, esperadas in columnas_requeridas.items():
+            for columna in sorted(esperadas - columnas_por_tabla.get(tabla, set())):
+                columnas_faltantes.append(f"{tabla}.{columna}")
+        if columnas_faltantes:
+            return {
+                "ok": False,
+                "integrity": "Faltan columnas necesarias para V16/auditoría; no publiques esta versión.",
+                "foreign_keys": [], "quick": "", "faltantes": columnas_faltantes,
+            }
 
         return {
             "ok": True,
@@ -1433,67 +1623,35 @@ def verificar_integridad_db(db_path=None):
         conn.close()
 
 
-def reiniciar_datos_prueba_sin_backup():
-    """Reinicia datos transaccionales en la base CENTRAL.
 
-    Conserva productos, usuarios, sucursales y configuración fiscal.
-    Pone el stock central en 0 y elimina ventas, cotizaciones, clientes
-    y registros de facturación de prueba.
-
-    Esta acción afecta al inventario central compartido por las sucursales
-    y está protegida por el rol Administrador en la interfaz.
-    """
-    conn = get_conn()
-    tablas_transaccionales = [
-        "detalle_facturas",
-        "eventos_facturacion",
-        "sincronizacion_sin",
-        "facturas",
-        "detalle_cotizaciones",
-        "cotizaciones",
-        "detalle_ventas",
-        "ventas",
-        "movimientos_inventario",
-        "clientes",
-    ]
+# ---------------------- AUDITORÍA V16 --------------------------
+def registrar_auditoria(evento, detalle="", resultado="Correcto", usuario_override=None):
+    """Guarda actividad sin exponer el historial a usuarios no administradores."""
     try:
-        conn.execute("BEGIN")
+        current = usuario_override or st.session_state.get("usuario") or {}
+        nombre = str(current.get("usuario") or "desconocido")
+        rol_actual = str(current.get("rol") or "Desconocido")
+        uid = current.get("id")
+        sid = current.get("sucursal_id") or st.session_state.get("sucursal_id")
+        conn = get_conn()
+        try:
+            conn.execute(
+                """INSERT INTO auditoria_actividad
+                   (usuario_id, usuario, rol, sucursal_id, evento, detalle, resultado, fecha_hora)
+                   VALUES(?,?,?,?,?,?,?,?)""",
+                (uid, nombre, rol_actual, sid, str(evento)[:160], str(detalle)[:2000],
+                 str(resultado)[:80], datetime.now())
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        # Una falla del registro no debe tumbar toda la aplicación; revisar logs del servidor.
+        pass
 
-        # Se eliminan primero las tablas hijas para respetar las FK.
-        for tabla in tablas_transaccionales:
-            conn.execute(f"DELETE FROM {tabla}")
 
-        # Los productos registrados se conservan; solo se reinicia su stock.
-        conn.execute("UPDATE productos SET stock=0")
-
-        # Reiniciar numeración fiscal de prueba para todas las sucursales.
-        conn.execute("UPDATE configuracion_fiscal SET numero_factura_actual=0")
-
-        # Cliente técnico requerido por ventas/cotizaciones.
-        conn.execute(
-            """INSERT INTO clientes
-               (nit_ci,nombre,telefono,direccion,tipo,creado_en)
-               VALUES(?,?,?,?,?,?)""",
-            ("0", "Cliente General", "", "", "Particular", datetime.now())
-        )
-
-        conn.commit()
-        # Invalidar lecturas cacheadas tras cualquier escritura.
-        st.cache_data.clear()
-
-        # Las copias de seguridad de la base central corresponden a Supabase;
-        # no se manipulan archivos .db locales.
-        return True, (
-            "Reinicio completado en la base central. Se conservaron todos los "
-            "productos y sus datos; el stock quedó en 0. Se eliminaron los "
-            "datos de pruebas, clientes, ventas, cotizaciones y movimientos. "
-            "El Cliente General quedó como cliente técnico."
-        )
-    except Exception as exc:
-        conn.rollback()
-        return False, f"No se pudo completar el reinicio: {exc}"
-    finally:
-        conn.close()
+def registrar_descarga_inventario():
+    registrar_auditoria("Descargó inventario PDF", "Exportación del inventario", "Correcto")
 
 
 # ------------------------- LOGIN ------------------------------
@@ -1633,8 +1791,10 @@ if st.session_state.usuario is None:
             if row and verify_password(password, row["password"]):
                 st.session_state.usuario = dict(row)
                 st.session_state.sucursal_id = row["sucursal_id"]
+                registrar_auditoria("Inicio de sesión", "Acceso al sistema", "Correcto", dict(row))
                 st.rerun()
             else:
+                registrar_auditoria("Intento de inicio de sesión", f"Usuario ingresado: {usuario.strip()[:120]}", "Denegado", {"usuario": usuario.strip() or "desconocido", "rol": "No autenticado", "id": None})
                 st.error("Usuario o contraseña incorrectos.")
 
     st.markdown(
@@ -1695,29 +1855,33 @@ with st.sidebar:
     st.caption(f"🏢 Sucursal: {nombre_sucursal()}")
     st.divider()
 
-    opciones = [
-        "📊 Dashboard",
-        "🛒 Punto de Venta",
-        "📦 Productos",
-        "📋 Inventario",
-        "👥 Clientes",
-        "💰 Ventas",
-        "🧾 Cotizaciones",
-        "🧾 Facturación",
-    ]
-
-    if user["rol"] == "Administrador":
-        opciones += ["👤 Usuarios", "💾 Copias de seguridad"]
+    if user["rol"] == "Socio":
+        # Menú de consulta: el Socio nunca entra a formularios heredados de escritura.
+        opciones = ["📊 Dashboard", "🛒 Punto de Venta", "📦 Productos", "📋 Inventario", "💰 Ventas"]
+    else:
+        opciones = [
+            "📊 Dashboard", "🛒 Punto de Venta", "📦 Productos", "📋 Inventario",
+            "👥 Clientes", "💰 Ventas", "🧾 Cotizaciones", "🧾 Facturación",
+        ]
+        if user["rol"] == "Administrador":
+            opciones += ["👤 Usuarios", "🕵️ Auditoría del sistema", "💾 Copias de seguridad"]
 
     pagina = st.radio("MENÚ", opciones)
 
     st.divider()
 
     if st.button("🚪 Cerrar sesión", width="stretch"):
+        registrar_auditoria("Cierre de sesión", "El usuario cerró sesión", "Correcto")
         st.session_state.usuario = None
         st.session_state.carrito = []
         st.rerun()
 
+
+# Registrar navegación entre módulos, evitando duplicados por cada rerun de Streamlit.
+_pagina_anterior = st.session_state.get("auditoria_pagina_actual")
+if _pagina_anterior != pagina:
+    registrar_auditoria("Acceso a módulo", str(pagina), "Correcto")
+    st.session_state.auditoria_pagina_actual = pagina
 
 # ------------------------- CABECERA ---------------------------
 
@@ -1731,6 +1895,147 @@ st.markdown(
     unsafe_allow_html=True
 )
 
+
+# ==================== VISTA SEGURA SOCIO ======================
+# Separación de interfaz por rol: SOCIO nunca ejecuta los módulos heredados
+# que contienen escrituras, anulaciones, administración o configuración.
+if user.get("rol") == "Socio":
+    registrar_auditoria("Acceso a vista SOCIO", f"Módulo: {pagina}", "Correcto")
+
+    if pagina == "📊 Dashboard":
+        st.title("📊 Resumen general — solo lectura")
+        r = query_df("""
+            SELECT
+              (SELECT COALESCE(SUM(total),0) FROM ventas WHERE estado='ACTIVA' AND fecha::date=CURRENT_DATE) AS ventas_hoy,
+              (SELECT COALESCE(SUM(total),0) FROM ventas WHERE estado='ACTIVA' AND fecha >= date_trunc('month',CURRENT_DATE)) AS ventas_mes,
+              (SELECT COUNT(*) FROM productos WHERE activo=TRUE) AS productos,
+              (SELECT COALESCE(SUM(stock),0) FROM inventario_sucursal) AS unidades
+        """).iloc[0]
+        a,b,c,d=st.columns(4)
+        a.metric("Ventas de hoy", money(r['ventas_hoy']))
+        b.metric("Ventas del mes", money(r['ventas_mes']))
+        c.metric("Productos activos", int(r['productos']))
+        d.metric("Unidades en ambas sucursales", f"{float(r['unidades']):,.0f}")
+        st.caption("Modo SOCIO: consulta únicamente; no se permiten modificaciones ni ventas.")
+
+    elif pagina == "📦 Productos":
+        st.title("📦 Catálogo de productos — solo lectura")
+        dfp=query_df("""SELECT codigo AS \"Código\", nombre AS \"Producto\", categoria AS \"Categoría\",
+                             marca AS \"Marca\", precio AS \"Precio (Bs)\", activo
+                      FROM productos WHERE activo=TRUE ORDER BY nombre""")
+        st.dataframe(dfp.drop(columns=["activo"], errors="ignore"), width="stretch", hide_index=True)
+
+    elif pagina == "📋 Inventario":
+        st.title("📋 Inventario consolidado — ambas sucursales")
+        dfi=query_df("""SELECT p.codigo AS \"Código\", p.nombre AS \"Producto\", p.categoria AS \"Categoría\",
+                            p.marca AS \"Marca\", s.nombre AS \"Sucursal\", COALESCE(i.stock,0) AS \"Stock\",
+                            p.stock_minimo AS \"Mínimo\", p.costo AS \"Costo compra\", p.precio AS \"Costo venta\",
+                            COALESCE(i.stock,0)*p.costo AS \"Total compra\", COALESCE(i.stock,0)*p.precio AS \"Total venta\"
+                     FROM productos p CROSS JOIN sucursales s
+                     LEFT JOIN inventario_sucursal i ON i.producto_id=p.id AND i.sucursal_id=s.id
+                     WHERE p.activo=TRUE AND s.activa=TRUE ORDER BY p.nombre,s.nombre""")
+        st.dataframe(dfi, width="stretch", hide_index=True)
+        pdf=generar_pdf_inventario(dfi)
+        if pdf is not None:
+            st.download_button("📄 Generar PDF del inventario", data=pdf,
+                file_name=f"inventario_guelmar_socio_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
+                mime="application/pdf", on_click=lambda: registrar_auditoria("Descarga inventario PDF", "Inventario consolidado de sucursales", "Correcto"))
+        else:
+            st.info("La función de PDF no está disponible; revisa que ReportLab esté instalado.")
+        st.caption("La vista es de consulta. No hay botones para entradas, ajustes ni traslados.")
+
+    elif pagina == "🛒 Punto de Venta":
+        st.title("🛒 Consulta de productos y carrito — sin ventas")
+        st.warning("El rol SOCIO puede preparar un carrito, pero no puede registrar ni cobrar ventas.")
+        catalogo=query_df("""SELECT p.id,p.codigo,p.nombre,p.precio,COALESCE(SUM(i.stock),0) AS stock
+                            FROM productos p LEFT JOIN inventario_sucursal i ON i.producto_id=p.id
+                            WHERE p.activo=TRUE GROUP BY p.id,p.codigo,p.nombre,p.precio ORDER BY p.nombre""")
+        if not catalogo.empty:
+            opciones={f"{r.codigo} · {r.nombre} — {money(r.precio)} (stock {float(r.stock):g})":int(r.id) for r in catalogo.itertuples()}
+            seleccionado=st.selectbox("Producto", list(opciones.keys()), key="socio_producto_carrito")
+            cantidad=st.number_input("Cantidad", min_value=1, step=1, value=1, key="socio_cantidad_carrito")
+            if st.button("＋ Agregar al carrito", key="socio_agregar_carrito"):
+                pid=opciones[seleccionado]
+                prod=catalogo[catalogo.id==pid].iloc[0]
+                if float(prod.stock) < cantidad:
+                    registrar_auditoria("Intento de carrito sin stock", f"Producto={prod.nombre}; cantidad={cantidad}; stock={prod.stock}", "Denegado")
+                    st.error("La cantidad supera el stock disponible.")
+                else:
+                    carrito=st.session_state.setdefault("carrito_socio", [])
+                    carrito.append({"producto_id":pid,"codigo":str(prod.codigo),"nombre":str(prod.nombre),"precio":float(prod.precio),"cantidad":int(cantidad)})
+                    registrar_auditoria("Agregó producto al carrito", f"Producto={prod.nombre}; cantidad={cantidad}", "Correcto")
+                    st.rerun()
+        carrito=st.session_state.get("carrito_socio", [])
+        st.subheader("Carrito preparado (no es una venta)")
+        if carrito:
+            st.dataframe(pd.DataFrame([{**x,"subtotal":x["precio"]*x["cantidad"]} for x in carrito]), width="stretch", hide_index=True)
+            st.metric("Total referencial", money(sum(x["precio"]*x["cantidad"] for x in carrito)))
+            if st.button("Vaciar carrito", key="socio_vaciar_carrito"):
+                st.session_state.carrito_socio=[]
+                registrar_auditoria("Vació carrito", "Carrito de consulta", "Correcto")
+                st.rerun()
+        else:
+            st.info("Todavía no agregaste productos.")
+        st.error("El botón de registrar venta/cobro está deshabilitado para el rol SOCIO.")
+
+    elif pagina == "💰 Ventas":
+        st.title("💰 Informes de ventas — ambas sucursales")
+        periodo = st.selectbox("Período", ["Hoy", "Esta semana", "Quincena (últimos 15 días)", "Este mes", "Este año", "Personalizado"], key="socio_ventas_periodo")
+        desde_def, hasta_def = rango_periodo_ventas(periodo)
+        c1, c2, c3 = st.columns(3)
+        if periodo == "Personalizado":
+            desde = c1.date_input("Desde", value=desde_def, key="socio_ventas_desde")
+            hasta = c2.date_input("Hasta", value=hasta_def, key="socio_ventas_hasta")
+        else:
+            desde, hasta = desde_def, hasta_def
+            c1.info(f"Desde: {desde:%d/%m/%Y}")
+            c2.info(f"Hasta: {hasta:%d/%m/%Y}")
+        ramas = ["Todas"] + query_df("SELECT nombre FROM sucursales WHERE activa=TRUE ORDER BY nombre")["nombre"].astype(str).tolist()
+        sucursal = c3.selectbox("Sucursal", ramas, key="socio_ventas_sucursal")
+        if hasta < desde:
+            st.error("La fecha final no puede ser anterior a la inicial.")
+        else:
+            filtros = ["v.fecha::date BETWEEN ? AND ?"]
+            params = [desde.isoformat(), hasta.isoformat()]
+            if sucursal != "Todas":
+                filtros.append("s.nombre = ?")
+                params.append(sucursal)
+            dventas = query_df(f"""SELECT v.id AS "N.º venta", v.fecha AS "Fecha",
+                    COALESCE(c.nombre,'Cliente General') AS "Cliente",
+                    COALESCE(u.usuario,'') AS "Vendedor", COALESCE(s.nombre,'Sin sucursal') AS "Sucursal",
+                    COALESCE((SELECT string_agg(dv.nombre || ' x' || dv.cantidad::text, ', ' ORDER BY dv.id)
+                              FROM detalle_ventas dv WHERE dv.venta_id=v.id), '') AS "Productos y cantidades",
+                    v.subtotal AS "Subtotal", v.descuento AS "Descuento", v.total AS "Total",
+                    v.metodo_pago AS "Pago", v.estado AS "Estado"
+                    FROM ventas v LEFT JOIN clientes c ON c.id=v.cliente_id
+                    LEFT JOIN usuarios u ON u.id=v.vendedor_id LEFT JOIN sucursales s ON s.id=v.sucursal_id
+                    WHERE {" AND ".join(filtros)} ORDER BY v.fecha DESC, v.id DESC""", tuple(params))
+            activas = dventas[dventas["Estado"] == "ACTIVA"] if not dventas.empty else dventas
+            total = pd.to_numeric(activas["Total"], errors="coerce").fillna(0).sum() if not activas.empty else 0
+            m1,m2,m3 = st.columns(3)
+            m1.metric("Ventas activas", len(activas))
+            m2.metric("Total vendido", money(total))
+            m3.metric("Ventas anuladas", int((dventas["Estado"] == "ANULADA").sum()) if not dventas.empty else 0)
+            st.dataframe(dventas, width="stretch", hide_index=True)
+            excel = exportar_ventas_excel(dventas)
+            pdf = exportar_ventas_pdf(dventas, f"GUELMAR — Ventas {desde:%d/%m/%Y} al {hasta:%d/%m/%Y}")
+            e1,e2 = st.columns(2)
+            if excel:
+                e1.download_button("📊 Descargar Excel", data=excel, file_name=f"ventas_{desde}_{hasta}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    on_click=lambda: registrar_auditoria("Descargó informe ventas Excel", f"{desde} a {hasta}; sucursal={sucursal}", "Correcto"))
+            else:
+                e1.info("No se pudo preparar Excel; verifica que openpyxl esté instalado.")
+            if pdf:
+                e2.download_button("📄 Descargar PDF", data=pdf, file_name=f"ventas_{desde}_{hasta}.pdf",
+                    mime="application/pdf",
+                    on_click=lambda: registrar_auditoria("Descargó informe ventas PDF", f"{desde} a {hasta}; sucursal={sucursal}", "Correcto"))
+            else:
+                e2.info("No se pudo preparar PDF; verifica ReportLab.")
+            st.caption("Solo lectura: las ventas anuladas se muestran, pero no se editan ni eliminan.")
+
+    # Termina aquí la ejecución del SOCIO: ningún código legado con escrituras se alcanza.
+    st.stop()
 
 # ========================= DASHBOARD ==========================
 
@@ -1888,6 +2193,7 @@ elif pagina == "📦 Productos":
                     # Invalidar lecturas cacheadas tras cualquier escritura.
                     st.cache_data.clear()
                     conn.close()
+                    registrar_auditoria("Desactivó producto", f"Producto ID={mapa[elegido]}", "Correcto")
                     st.success("Producto desactivado.")
                     st.rerun()
 
@@ -1945,14 +2251,17 @@ elif pagina == "📦 Productos":
                                 (imagen_relativa, producto_id)
                             )
 
+                        sid_producto = sucursal_actual_id()
+                        guardar_stock_sucursal(conn, producto_id, sid_producto, stock)
                         if stock > 0:
                             registrar_movimiento(
                                 conn, producto_id, "ENTRADA", stock, 0, stock,
-                                "Stock inicial", user["id"]
+                                "Stock inicial", user["id"], sid_producto
                             )
                         conn.commit()
                         # Invalidar lecturas cacheadas tras cualquier escritura.
                         st.cache_data.clear()
+                        registrar_auditoria("Creó producto", f"Producto ID={producto_id}; código={codigo.strip()}; nombre={nombre.strip()}; stock inicial={stock}", "Correcto")
                         st.success("Producto creado correctamente." + (" Imagen guardada." if imagen_relativa else ""))
                     except (psycopg2.IntegrityError,):
                         if imagen_guardada and imagen_guardada.exists():
@@ -2262,6 +2571,7 @@ elif pagina == "📦 Productos":
                                     conn.commit()
                                     # Invalidar lecturas cacheadas tras cualquier escritura.
                                     st.cache_data.clear()
+                                    registrar_auditoria("Editó producto", f"Producto ID={producto_edit['id']}; código={codigo_nuevo}; nombre={nombre_nuevo}; precio={precio_edit}; costo={costo_edit}; stock mínimo={minimo_edit}", "Correcto")
 
                                     # Sincronizar un carrito abierto para que el cambio se
                                     # vea inmediatamente y no se venda con datos antiguos.
@@ -2295,16 +2605,21 @@ elif pagina == "📦 Productos":
 elif pagina == "📋 Inventario":
     st.markdown('<div class="section-title">📋 Control de inventario</div>', unsafe_allow_html=True)
 
-    tab1, tab2 = st.tabs(["📦 Existencias", "↕️ Movimiento"])
+    tab1, tab2, tab3 = st.tabs(["📦 Existencias", "↕️ Movimiento", "🔁 Transferir entre sucursales"])
 
     with tab1:
         df = query_df("""
-            SELECT codigo AS "Código", nombre AS "Producto", categoria AS "Categoría",
-                   marca AS "Marca", stock AS "Stock", stock_minimo AS "Mínimo",
-                   costo AS "Costo compra", precio AS "Costo venta"
-            FROM productos
-            WHERE activo=TRUE
-            ORDER BY nombre
+            SELECT p.codigo AS "Código", p.nombre AS "Producto", p.categoria AS "Categoría",
+                   p.marca AS "Marca", p.stock AS "Stock", p.stock_minimo AS "Mínimo",
+                   p.costo AS "Costo compra", p.precio AS "Costo venta",
+                   COALESCE(SUM(CASE WHEN s.nombre ILIKE '%La Paz%' THEN i.stock ELSE 0 END),0) AS "La Paz",
+                   COALESCE(SUM(CASE WHEN s.nombre ILIKE '%El Alto%' THEN i.stock ELSE 0 END),0) AS "El Alto"
+            FROM productos p
+            LEFT JOIN inventario_sucursal i ON i.producto_id=p.id
+            LEFT JOIN sucursales s ON s.id=i.sucursal_id
+            WHERE p.activo=TRUE
+            GROUP BY p.id,p.codigo,p.nombre,p.categoria,p.marca,p.stock,p.stock_minimo,p.costo,p.precio
+            ORDER BY p.nombre
         """)
 
         if df.empty:
@@ -2367,7 +2682,7 @@ elif pagina == "📋 Inventario":
                 unsafe_allow_html=True,
             )
 
-            if user["rol"] == "Administrador":
+            if user["rol"] in ("Administrador", "Socio"):
                 st.markdown("### 🖨️ Imprimir y generar PDF")
                 st.markdown("**¿Qué productos deseas incluir en la exportación?**")
                 filtro_exportacion = st.radio(
@@ -2406,6 +2721,7 @@ elif pagina == "📋 Inventario":
                             file_name=f"inventario_guelmar_{nombre_filtro}_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
                             mime="application/pdf",
                             width="stretch",
+                            on_click=registrar_descarga_inventario,
                         )
 
                 with c_print:
@@ -2427,11 +2743,15 @@ elif pagina == "📋 Inventario":
         if user["rol"] != "Administrador":
             st.info("🔒 Solo el Administrador puede registrar entradas, salidas o ajustes de inventario.\n\nPuedes consultar las existencias y el historial de movimientos.")
         else:
-            dfp = query_df("SELECT id, codigo, nombre, stock FROM productos WHERE activo=TRUE ORDER BY nombre")
+            sid_mov = sucursal_actual_id()
+            dfp = query_df("""SELECT p.id,p.codigo,p.nombre,COALESCE(i.stock,0) AS stock
+                FROM productos p LEFT JOIN inventario_sucursal i
+                  ON i.producto_id=p.id AND i.sucursal_id=?
+                WHERE p.activo=TRUE ORDER BY p.nombre""", (sid_mov,))
             if dfp.empty:
                 st.info("Primero registra productos.")
             else:
-                opciones = {f"{r.codigo} · {r.nombre} (stock: {r.stock:g})": int(r.id) for r in dfp.itertuples()}
+                opciones = {f"{r.codigo} · {r.nombre} (stock en {nombre_sucursal(sid_mov)}: {r.stock:g})": int(r.id) for r in dfp.itertuples()}
                 elegido = st.selectbox("Producto", list(opciones.keys()))
                 tipo = st.selectbox("Tipo de movimiento", ["ENTRADA", "SALIDA", "AJUSTE"])
                 if tipo == "AJUSTE":
@@ -2447,39 +2767,30 @@ elif pagina == "📋 Inventario":
                     elif not motivo.strip():
                         st.error("Escribe un motivo para registrar el movimiento.")
                     else:
-                        anterior = float(producto["stock"])
-                        if tipo == "ENTRADA":
-                            nuevo = anterior + cantidad
-                        elif tipo == "SALIDA":
-                            nuevo = anterior - cantidad
-                            if nuevo < 0:
-                                st.error("No hay stock suficiente.")
-                                st.stop()
-                        else:
-                            nuevo = cantidad
+                        sid_mov = sucursal_actual_id()
                         conn = get_conn()
                         try:
                             conn.execute("BEGIN")
                             producto_bloqueado = conn.execute(
-                                "SELECT stock FROM productos WHERE id=? FOR UPDATE",
-                                (producto["id"],)
+                                "SELECT id FROM productos WHERE id=? FOR UPDATE", (producto["id"],)
                             ).fetchone()
                             if not producto_bloqueado:
                                 raise ValueError("El producto ya no existe.")
-                            anterior = float(producto_bloqueado["stock"])
+                            anterior = obtener_stock_sucursal(conn, producto["id"], sid_mov)
                             if tipo == "ENTRADA":
                                 nuevo = anterior + cantidad
                             elif tipo == "SALIDA":
                                 nuevo = anterior - cantidad
                                 if nuevo < 0:
-                                    raise ValueError("No hay stock suficiente.")
+                                    raise ValueError("No hay stock suficiente en esta sucursal.")
                             else:
                                 nuevo = cantidad
-                            conn.execute("UPDATE productos SET stock=? WHERE id=?", (nuevo, producto["id"]))
-                            registrar_movimiento(conn, producto["id"], tipo, cantidad, anterior, nuevo, motivo.strip(), user["id"])
+                            guardar_stock_sucursal(conn, producto["id"], sid_mov, nuevo)
+                            registrar_movimiento(conn, producto["id"], tipo, cantidad, anterior, nuevo, motivo.strip(), user["id"], sid_mov)
                             conn.commit()
                             # Invalidar lecturas cacheadas tras cualquier escritura.
                             st.cache_data.clear()
+                            registrar_auditoria("Movimiento de inventario", f"Producto ID={producto['id']}; tipo={tipo}; anterior={anterior}; nuevo={nuevo}; motivo={motivo.strip()}", "Correcto")
                             st.success(f"Stock actualizado: {nuevo:g} unidades.")
                             st.rerun()
                         except Exception as exc:
@@ -2487,6 +2798,72 @@ elif pagina == "📋 Inventario":
                             st.error(f"No se pudo registrar el movimiento: {exc}")
                         finally:
                             conn.close()
+
+    with tab3:
+        if user["rol"] != "Administrador":
+            st.info("🔒 Solo el Administrador puede transferir existencias entre sucursales.")
+        else:
+            ds = sucursales_activas()
+            if len(ds) < 2:
+                st.warning("Se necesitan al menos dos sucursales activas para transferir stock.")
+            else:
+                sucursales_map = {str(r.nombre): int(r.id) for r in ds.itertuples()}
+                nombres_suc = list(sucursales_map.keys())
+                c_origen, c_destino = st.columns(2)
+                with c_origen:
+                    origen_nombre = st.selectbox("Sucursal de origen", nombres_suc, key="traslado_origen")
+                destinos = [n for n in nombres_suc if n != origen_nombre]
+                with c_destino:
+                    destino_nombre = st.selectbox("Sucursal de destino", destinos, key="traslado_destino")
+                sid_origen = sucursales_map[origen_nombre]
+                sid_destino = sucursales_map[destino_nombre]
+                productos_traslado = query_df("""SELECT p.id,p.codigo,p.nombre,COALESCE(i.stock,0) AS stock
+                    FROM productos p LEFT JOIN inventario_sucursal i
+                      ON i.producto_id=p.id AND i.sucursal_id=?
+                    WHERE p.activo=TRUE ORDER BY p.nombre""", (sid_origen,))
+                if productos_traslado.empty:
+                    st.info("No hay productos activos para transferir.")
+                else:
+                    mapa_traslado = {f"{r.codigo} · {r.nombre} (disponible: {r.stock:g})": (int(r.id), float(r.stock)) for r in productos_traslado.itertuples()}
+                    prod_traslado_txt = st.selectbox("Producto a transferir", list(mapa_traslado.keys()))
+                    cantidad_traslado = st.number_input("Cantidad a transferir", min_value=0.0, step=1.0, key="cantidad_traslado")
+                    motivo_traslado = st.text_input("Motivo / referencia", key="motivo_traslado", placeholder="Ej.: Reposición de mercadería")
+                    st.caption("La transferencia resta stock al origen y suma la misma cantidad al destino. El total general no cambia.")
+                    if st.button("🔁 Confirmar transferencia", type="primary", key="confirmar_traslado"):
+                        pid_traslado, disponible = mapa_traslado[prod_traslado_txt]
+                        if cantidad_traslado <= 0:
+                            st.error("La cantidad debe ser mayor a cero.")
+                        elif cantidad_traslado > disponible:
+                            st.error("La cantidad supera el stock disponible en la sucursal de origen.")
+                        elif not motivo_traslado.strip():
+                            st.error("Escribe un motivo o referencia para la transferencia.")
+                        else:
+                            conn = get_conn()
+                            try:
+                                conn.execute("BEGIN")
+                                conn.execute("SELECT id FROM productos WHERE id=? FOR UPDATE", (pid_traslado,))
+                                stock_origen = obtener_stock_sucursal(conn, pid_traslado, sid_origen)
+                                stock_destino = obtener_stock_sucursal(conn, pid_traslado, sid_destino)
+                                if cantidad_traslado > stock_origen:
+                                    raise ValueError("El stock de origen cambió. Actualiza la pantalla y vuelve a intentarlo.")
+                                nuevo_origen = stock_origen - cantidad_traslado
+                                nuevo_destino = stock_destino + cantidad_traslado
+                                guardar_stock_sucursal(conn, pid_traslado, sid_origen, nuevo_origen)
+                                guardar_stock_sucursal(conn, pid_traslado, sid_destino, nuevo_destino)
+                                registrar_movimiento(conn, pid_traslado, "TRASLADO_SALIDA", cantidad_traslado, stock_origen, nuevo_origen,
+                                    f"Transferencia a {destino_nombre}: {motivo_traslado.strip()}", user["id"], sid_origen)
+                                registrar_movimiento(conn, pid_traslado, "TRASLADO_ENTRADA", cantidad_traslado, stock_destino, nuevo_destino,
+                                    f"Transferencia desde {origen_nombre}: {motivo_traslado.strip()}", user["id"], sid_destino)
+                                conn.commit()
+                                st.cache_data.clear()
+                                registrar_auditoria("Transferencia de inventario", f"Producto ID={pid_traslado}; cantidad={cantidad_traslado}; origen={origen_nombre}; destino={destino_nombre}; motivo={motivo_traslado.strip()}", "Correcto")
+                                st.success(f"Transferencia registrada: {cantidad_traslado:g} unidad(es) de {origen_nombre} a {destino_nombre}. El stock general se mantiene igual.")
+                                st.rerun()
+                            except Exception as exc:
+                                conn.rollback()
+                                st.error(f"No se pudo completar la transferencia: {exc}")
+                            finally:
+                                conn.close()
 
     st.subheader("🕘 Historial de movimientos")
     hist = query_df("""
@@ -2595,6 +2972,7 @@ elif pagina == "👥 Clientes":
                         conn.commit()
                         # Invalidar lecturas cacheadas tras cualquier escritura.
                         st.cache_data.clear()
+                        registrar_auditoria("Creó cliente", f"NIT/CI={nit.strip()}; nombre={nombre.strip()}", "Correcto")
                         st.success("✅ Cliente creado correctamente.")
                     except (psycopg2.IntegrityError,):
                         st.error("⚠️ Ese NIT/CI ya está registrado.")
@@ -2701,6 +3079,7 @@ elif pagina == "👥 Clientes":
                             conn.commit()
                             # Invalidar lecturas cacheadas tras cualquier escritura.
                             st.cache_data.clear()
+                            registrar_auditoria("Actualizó cliente", f"Cliente ID={cliente_id}; NIT/CI={nuevo_nit.strip()}; nombre={nuevo_nombre.strip()}", "Correcto")
                             st.success("✅ Cliente actualizado correctamente.")
                             st.rerun()
                         except (psycopg2.IntegrityError,):
@@ -2983,12 +3362,15 @@ elif pagina == "🛒 Punto de Venta":
                 st.session_state.pop("ultima_venta_id", None)
                 st.rerun()
 
+    sid_pos = sucursal_actual_id()
     dfp = query_df("""
-        SELECT id, codigo, nombre, categoria, marca, precio, costo, stock, stock_minimo, imagen
-        FROM productos
-        WHERE activo=TRUE
-        ORDER BY nombre
-    """)
+        SELECT p.id,p.codigo,p.nombre,p.categoria,p.marca,p.precio,p.costo,
+               COALESCE(i.stock,0) AS stock,p.stock_minimo,p.imagen
+        FROM productos p
+        LEFT JOIN inventario_sucursal i ON i.producto_id=p.id AND i.sucursal_id=?
+        WHERE p.activo=TRUE
+        ORDER BY p.nombre
+    """, (sid_pos,))
 
     if dfp.empty:
         st.warning("No hay productos registrados. Ve a 📦 Productos.")
@@ -3177,7 +3559,14 @@ elif pagina == "🛒 Punto de Venta":
                 with a2:
                     vender = st.button("💳 REGISTRAR VENTA", width="stretch", type="primary", key="registrar_venta_pos_prof")
 
-                if vender:
+                if vender and user["rol"] == "Socio":
+                    resumen_carrito = ", ".join(
+                        f"{x.get('nombre', x.get('codigo', 'producto'))} x{x.get('cantidad', 0)}"
+                        for x in st.session_state.carrito
+                    )
+                    registrar_auditoria("Intentó registrar una venta", resumen_carrito or "Carrito vacío", "Bloqueado")
+                    st.error("El rol SOCIO puede preparar el carrito, pero no está autorizado para registrar ventas.")
+                elif vender:
                     if metodo == "Efectivo" and recibido < total:
                         st.error("El efectivo recibido es insuficiente.")
                     else:
@@ -3196,10 +3585,11 @@ elif pagina == "🛒 Punto de Venta":
                                 prod = conn.execute("SELECT * FROM productos WHERE id=? AND activo=TRUE FOR UPDATE", (item["producto_id"],)).fetchone()
                                 if not prod:
                                     raise ValueError(f"Producto no encontrado: {item['codigo']}")
-                                stock_anterior = float(prod["stock"])
+                                sid_venta = sucursal_actual_id()
+                                stock_anterior = obtener_stock_sucursal(conn, prod["id"], sid_venta)
                                 cantidad_item = float(item["cantidad"])
                                 if cantidad_item > stock_anterior:
-                                    raise ValueError(f"Stock insuficiente para {prod['nombre']}.")
+                                    raise ValueError(f"Stock insuficiente en {nombre_sucursal(sid_venta)} para {prod['nombre']}.")
                                 nuevo_stock = stock_anterior - cantidad_item
                                 conn.execute(
                                     """INSERT INTO detalle_ventas
@@ -3208,10 +3598,11 @@ elif pagina == "🛒 Punto de Venta":
                                     (venta_id, prod["id"], prod["codigo"], prod["nombre"], cantidad_item,
                                      money_float(item["precio"]), money_float(prod["costo"]), money_float(item["total"]))
                                 )
-                                conn.execute("UPDATE productos SET stock=? WHERE id=?", (nuevo_stock, prod["id"]))
+                                guardar_stock_sucursal(conn, prod["id"], sid_venta, nuevo_stock)
                                 registrar_movimiento(conn, prod["id"], "VENTA", cantidad_item,
-                                                     stock_anterior, nuevo_stock, f"Venta #{venta_id}", user["id"])
+                                                     stock_anterior, nuevo_stock, f"Venta #{venta_id}", user["id"], sid_venta)
                             conn.commit()
+                            registrar_auditoria("Registró venta", f"Venta #{venta_id}; total Bs {total:.2f}; método {metodo}", "Completada")
                             # Invalidar lecturas cacheadas tras cualquier escritura.
                             st.cache_data.clear()
                             st.session_state.carrito = []
@@ -3270,10 +3661,18 @@ elif pagina == "💰 Ventas":
 
     # ---------------------- FILTROS ----------------------
     st.subheader("🔎 Filtros de búsqueda")
+    periodo_sel = st.selectbox("Período rápido", ["Hoy", "Esta semana", "Quincena (últimos 15 días)", "Este mes", "Este año", "Personalizado"], key="ventas_periodo_rapido")
+    desde_def, hasta_def = rango_periodo_ventas(periodo_sel)
     f1, f2, f3, f4 = st.columns(4)
-    fecha_desde = f1.date_input("Fecha desde", value=date.today(), key="ventas_desde")
-    fecha_hasta = f2.date_input("Fecha hasta", value=date.today(), key="ventas_hasta")
-    sucursal_sel = f3.selectbox("Sucursal", ["Todas", "El Alto"], key="ventas_sucursal")
+    if periodo_sel == "Personalizado":
+        fecha_desde = f1.date_input("Fecha desde", value=desde_def, key="ventas_desde")
+        fecha_hasta = f2.date_input("Fecha hasta", value=hasta_def, key="ventas_hasta")
+    else:
+        fecha_desde, fecha_hasta = desde_def, hasta_def
+        f1.info(f"Desde: {fecha_desde:%d/%m/%Y}")
+        f2.info(f"Hasta: {fecha_hasta:%d/%m/%Y}")
+    ramas_ventas = ["Todas"] + query_df("SELECT nombre FROM sucursales WHERE activa=TRUE ORDER BY nombre")["nombre"].astype(str).tolist()
+    sucursal_sel = f3.selectbox("Sucursal", ramas_ventas, key="ventas_sucursal")
     estado_sel = f4.selectbox("Estado", ["Todos", "ACTIVA", "ANULADA"], key="ventas_estado")
 
     f5, f6, f7, f8 = st.columns(4)
@@ -3315,7 +3714,7 @@ elif pagina == "💰 Ventas":
                COALESCE(c.nombre,'Cliente General') AS "Cliente",
                COALESCE(u.usuario,'') AS "Vendedor",
                COALESCE(s.nombre,'El Alto') AS "Sucursal",
-               (SELECT COUNT(*) FROM detalle_ventas dv0 WHERE dv0.venta_id=v.id) AS "Producto"s,
+               (SELECT COUNT(*) FROM detalle_ventas dv0 WHERE dv0.venta_id=v.id) AS "Productos",
                v.subtotal AS "Subtotal",
                v.descuento AS "Descuento",
                v.total AS "Total",
@@ -3358,6 +3757,24 @@ elif pagina == "💰 Ventas":
             key="descargar_historial_ventas_csv",
         )
     with ec2:
+        excel_ventas = exportar_ventas_excel(df)
+        pdf_ventas = exportar_ventas_pdf(df, f"GUELMAR — Ventas {fecha_desde:%d/%m/%Y} al {fecha_hasta:%d/%m/%Y}")
+        ex1, ex2 = st.columns(2)
+        if excel_ventas:
+            ex1.download_button("📘 Descargar Excel", data=excel_ventas,
+                file_name=f"historial_ventas_{fecha_desde}_{fecha_hasta}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="descargar_historial_ventas_excel",
+                on_click=lambda: registrar_auditoria("Descargó informe ventas Excel", f"{fecha_desde} a {fecha_hasta}; sucursal={sucursal_sel}", "Correcto"))
+        else:
+            ex1.caption("Excel no disponible: verifica openpyxl.")
+        if pdf_ventas:
+            ex2.download_button("📄 Descargar PDF", data=pdf_ventas,
+                file_name=f"historial_ventas_{fecha_desde}_{fecha_hasta}.pdf",
+                mime="application/pdf", key="descargar_historial_ventas_pdf",
+                on_click=lambda: registrar_auditoria("Descargó informe ventas PDF", f"{fecha_desde} a {fecha_hasta}; sucursal={sucursal_sel}", "Correcto"))
+        else:
+            ex2.caption("PDF no disponible: verifica ReportLab.")
         if not df.empty:
             st.caption(f"{len(df)} venta(s) encontrada(s). Las métricas excluyen ventas anuladas.")
         else:
@@ -3534,6 +3951,12 @@ elif pagina == "💰 Ventas":
                     conn = get_conn()
                     try:
                         conn.execute("BEGIN")
+                        venta_sucursal = conn.execute(
+                            "SELECT sucursal_id FROM ventas WHERE id=? FOR UPDATE", (venta_accion_id,)
+                        ).fetchone()
+                        if not venta_sucursal:
+                            raise ValueError("No se encontró la venta que se desea anular.")
+                        sid_anulacion = venta_sucursal["sucursal_id"]
                         detalles = conn.execute(
                             "SELECT * FROM detalle_ventas WHERE venta_id=?",
                             (venta_accion_id,)
@@ -3545,17 +3968,14 @@ elif pagina == "💰 Ventas":
                                 (item["producto_id"],)
                             ).fetchone()
                             if prod:
-                                anterior = float(prod["stock"])
+                                anterior = obtener_stock_sucursal(conn, prod["id"], sid_anulacion)
                                 nuevo = anterior + float(item["cantidad"])
-                                conn.execute(
-                                    "UPDATE productos SET stock=? WHERE id=?",
-                                    (nuevo, prod["id"])
-                                )
+                                guardar_stock_sucursal(conn, prod["id"], sid_anulacion, nuevo)
                                 registrar_movimiento(
                                     conn, prod["id"], "ANULACION", float(item["cantidad"]),
                                     anterior, nuevo,
                                     f"Anulación venta #{venta_accion_id} · {motivo_anulacion.strip()}",
-                                    user["id"]
+                                    user["id"], sid_anulacion
                                 )
 
                         cur_anul = conn.execute(
@@ -3568,6 +3988,7 @@ elif pagina == "💰 Ventas":
                         conn.commit()
                         # Invalidar lecturas cacheadas tras cualquier escritura.
                         st.cache_data.clear()
+                        registrar_auditoria("Anuló venta", f"Venta ID={venta_accion_id}; motivo={motivo_anulacion.strip()}; stock restaurado", "Correcto")
                         st.success(
                             f"Venta #{venta_accion_id:06d} anulada correctamente. "
                             "El stock fue restaurado y la operación quedó registrada."
@@ -3783,6 +4204,7 @@ elif pagina == "🧾 Cotizaciones":
                         st.cache_data.clear()
                         st.session_state.cot_carrito = []
                         st.session_state.ultima_cotizacion_id = int(cot_id)
+                        registrar_auditoria("Creó cotización", f"Cotización ID={cot_id}; total={total}", "Correcto")
                         st.success(f"Cotización #{cot_id} guardada.")
                     except Exception as exc:
                         conn.rollback()
@@ -3894,6 +4316,7 @@ elif pagina == "🧾 Cotizaciones":
                         if st.session_state.get("ultima_cotizacion_id") == cot_hist_id:
                             st.session_state.pop("ultima_cotizacion_id", None)
 
+                        registrar_auditoria("Eliminó cotización", f"Cotización ID={cot_hist_id}", "Correcto")
                         st.success(f"Cotización #{cot_hist_id:06d} eliminada correctamente.")
                         st.rerun()
                     except Exception as exc:
@@ -3909,6 +4332,36 @@ elif pagina == "🧾 Cotizaciones":
                     st.dataframe(detalle, width="stretch", hide_index=True)
                 else:
                     st.info("Esta cotización no tiene productos registrados.")
+
+
+# ======================== AUDITORÍA ============================
+elif pagina == "🕵️ Auditoría del sistema":
+    if user["rol"] != "Administrador":
+        st.error("No tienes permisos para esta sección.")
+    else:
+        st.markdown('<div class="section-title">🕵️ Auditoría del sistema</div>', unsafe_allow_html=True)
+        st.caption("Registro de inicios de sesión, navegación, intentos de venta y descargas. Solo visible para el administrador.")
+        a1, a2, a3 = st.columns(3)
+        fecha_a_desde = a1.date_input("Desde", value=date.today(), key="audit_desde")
+        fecha_a_hasta = a2.date_input("Hasta", value=date.today(), key="audit_hasta")
+        usuarios_audit = ["Todos"] + query_df("SELECT DISTINCT usuario FROM auditoria_actividad ORDER BY usuario")["usuario"].astype(str).tolist()
+        usuario_audit = a3.selectbox("Usuario", usuarios_audit, key="audit_usuario")
+        if fecha_a_hasta < fecha_a_desde:
+            st.error("La fecha final no puede ser anterior a la fecha inicial.")
+        else:
+            sql_audit = """SELECT fecha_hora AS "Fecha y hora", usuario AS "Usuario", rol AS "Rol",
+                         evento AS "Actividad", detalle AS "Detalle", resultado AS "Resultado",
+                         COALESCE(s.nombre, 'Sin sucursal') AS "Sucursal"
+                         FROM auditoria_actividad a LEFT JOIN sucursales s ON s.id=a.sucursal_id
+                         WHERE fecha_hora::date BETWEEN ? AND ?"""
+            params_audit = [fecha_a_desde.isoformat(), fecha_a_hasta.isoformat()]
+            if usuario_audit != "Todos":
+                sql_audit += " AND usuario=?"
+                params_audit.append(usuario_audit)
+            sql_audit += " ORDER BY fecha_hora DESC LIMIT 3000"
+            df_audit = query_df(sql_audit, tuple(params_audit))
+            st.dataframe(df_audit, width="stretch", hide_index=True)
+            st.caption(f"Registros mostrados: {len(df_audit)}. El historial se conserva en Supabase.")
 
 
 # =========================== USUARIOS ==========================
@@ -3937,7 +4390,7 @@ elif pagina == "👤 Usuarios":
             with st.form("nuevo_usuario"):
                 nuevo_usuario = st.text_input("Usuario *")
                 nueva_password = st.text_input("Contraseña *", type="password")
-                rol = st.selectbox("Rol", ["Vendedor", "Administrador"])
+                rol = st.selectbox("Rol", ["Vendedor", "Socio", "Administrador"])
                 ramas = query_df("SELECT id, nombre FROM sucursales WHERE activa=TRUE ORDER BY id")
                 ramas_map = {r["nombre"]: int(r["id"]) for _, r in ramas.iterrows()}
                 sucursal_nueva = st.selectbox("Sucursal", list(ramas_map.keys()))
@@ -3960,6 +4413,7 @@ elif pagina == "👤 Usuarios":
                             conn.commit()
                             # Invalidar lecturas cacheadas tras cualquier escritura.
                             st.cache_data.clear()
+                            registrar_auditoria("Creó usuario", f"Usuario={nuevo_usuario.strip()}; rol={rol}; sucursal={sucursal_nueva}", "Correcto")
                             st.success("Usuario creado.")
                         except (psycopg2.IntegrityError,):
                             st.error("Ese usuario ya existe.")
@@ -4078,6 +4532,7 @@ elif pagina == "🧾 Facturación":
                 # Invalidar lecturas cacheadas tras cualquier escritura.
                 st.cache_data.clear()
                 conn.close()
+                registrar_auditoria("Actualizó configuración fiscal", f"Sucursal ID={sucursal_fiscal_id}", "Correcto")
                 st.success("Configuración fiscal guardada.")
                 st.rerun()
 
@@ -4199,6 +4654,7 @@ elif pagina == "🧾 Facturación":
                                 ahora, ahora
                             ))
                             factura_id = cur.lastrowid
+                            registrar_auditoria("Creó factura borrador", f"Factura ID={factura_id}; venta ID={venta_id}; número={numero}; total={float(vr['total'] or 0):.2f}", "Correcto")
 
                             detalles = conn.execute("""
                                 SELECT producto_id, codigo, nombre, cantidad,
@@ -4272,60 +4728,30 @@ elif pagina == "🧾 Facturación":
 
 # ======================== BACKUPS =============================
 
+
 elif pagina == "💾 Copias de seguridad":
     if user["rol"] != "Administrador":
         st.error("No tienes permisos para esta sección.")
     else:
-        st.markdown('<div class="section-title">💾 Copias de seguridad y reinicio</div>', unsafe_allow_html=True)
-
-        st.subheader("🧪 Reiniciar sistema para nuevas pruebas")
+        st.markdown('<div class="section-title">🛡️ Estado y recuperación</div>', unsafe_allow_html=True)
         st.warning(
-            "Esta acción conservará TODOS los productos registrados y pondrá su stock en 0. "
-            "Eliminará ventas, movimientos, cotizaciones, facturación de prueba y clientes. "
-            "También eliminará las copias de seguridad existentes. Usuarios y configuración se conservan."
+            "Esta versión no incluye un botón para borrar ventas, cotizaciones, clientes, "
+            "movimientos ni existencias. Antes de cualquier migración, realiza y verifica "
+            "un respaldo desde Supabase."
         )
-        confirmar_reinicio = st.checkbox(
-            "Entiendo que los datos de prueba y las copias de seguridad serán eliminados",
-            key="v1415_confirmar_reinicio"
-        )
-        if st.button(
-            "🔴 REINICIAR TODO PARA NUEVAS PRUEBAS",
-            width="stretch",
-            type="primary",
-            key="v1415_reiniciar"
-        ):
-            if not confirmar_reinicio:
-                st.error("Marca la casilla de confirmación antes de continuar.")
-            else:
-                ok, mensaje = reiniciar_datos_prueba_sin_backup()
-                st.session_state.carrito = []
-                st.session_state.cot_carrito = []
-                st.session_state.pop("ultima_venta_id", None)
-                st.session_state.pop("ultima_cotizacion_id", None)
-                if ok:
-                    st.success(mensaje)
-                    st.session_state.v1415_confirmar_reinicio = False
-                    st.rerun()
-                else:
-                    st.error(mensaje)
-
-        st.divider()
-        st.subheader("🛡️ Estado de la base de datos central")
-        if st.button("🔍 Verificar conexión e integridad", width="stretch", key="v14_verificar_integridad"):
+        if st.button("🔍 Verificar conexión e integridad", width="stretch", key="v16_verificar_integridad"):
             resultado = verificar_integridad_db()
             if resultado["ok"]:
-                st.success(
-                    "Base central PostgreSQL/Supabase conectada y estructura esencial verificada."
-                )
+                st.success("Base central PostgreSQL/Supabase conectada y estructura esencial verificada.")
             else:
                 st.error(f"Se detectaron problemas en la base central: {resultado.get('integrity')}")
                 if resultado.get("faltantes"):
                     st.warning(f"Tablas faltantes: {', '.join(resultado['faltantes'])}")
-
         st.subheader("☁️ Copias de seguridad")
         st.info(
-            "GUELMAR CLOUD no crea archivos .db locales. La base central utiliza "
-            "las copias y mecanismos de recuperación de Supabase."
+            "La base central utiliza Supabase. Confirma que exista un respaldo recuperable "
+            "antes de aplicar cambios de esquema o trasladar datos. Esta pantalla no borra ni "
+            "modifica respaldos."
         )
 
 
